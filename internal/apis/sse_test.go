@@ -14,6 +14,8 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
+
+	"go-agent-framework/internal/config"
 )
 
 // ---------- 测试辅助 ----------
@@ -39,6 +41,15 @@ func sseLine(reasoning, content, finish string) string {
 // chunkLine 拼一行只有 content 增量的 SSE data。
 func chunkLine(content string) string {
 	return sseLine("", content, "")
+}
+
+// testCfg 构造指向指定端点的测试配置，key/model 用固定占位值。
+func testCfg(endpoint string) config.Config {
+	return config.Config{
+		APIKey:       "test-key",
+		Endpoint:     endpoint,
+		DefaultModel: "deepseek-flash",
+	}
 }
 
 // drain 消费 handleStream，只聚合 EventContent 的文本，返回聚合结果与终止错误。
@@ -549,9 +560,10 @@ func TestStreamChatRequestContract(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	cfg := testCfg(srv.URL)
 	var sb strings.Builder
-	for ev, err := range StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{}) {
+	for ev, err := range StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{}, cfg) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -572,13 +584,13 @@ func TestStreamChatRequestContract(t *testing.T) {
 	if h := c.header.Get("Accept"); h != "text/event-stream" {
 		t.Errorf("Accept = %q", h)
 	}
-	if want := "Bearer " + apiKey; c.header.Get("Authorization") != want {
+	if want := "Bearer " + cfg.APIKey; c.header.Get("Authorization") != want {
 		t.Errorf("Authorization = %q, want %q", c.header.Get("Authorization"), want)
 	}
 
 	// 请求体契约
-	if c.req.Model != defaultModel {
-		t.Errorf("Model = %q, want %q", c.req.Model, defaultModel)
+	if c.req.Model != cfg.DefaultModel {
+		t.Errorf("Model = %q, want %q（配置下发的型号应原样进请求）", c.req.Model, cfg.DefaultModel)
 	}
 	if !c.req.Stream {
 		t.Error("Stream = false, 流式请求必须为 true")
@@ -630,8 +642,8 @@ func TestStreamChatRequestThinkingContract(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			for _, err := range StreamChat(context.Background(), srv.URL,
-				[]Message{{Role: "user", Content: "hi"}}, tt.opts) {
+			for _, err := range StreamChat(context.Background(),
+				[]Message{{Role: "user", Content: "hi"}}, tt.opts, testCfg(srv.URL)) {
 				if err != nil {
 					t.Fatalf("unexpected err: %v", err)
 				}
@@ -676,8 +688,8 @@ func TestStreamChatThinkingFlow(t *testing.T) {
 	defer srv.Close()
 
 	var evs []StreamEvent
-	for ev, err := range StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{Thinking: true}) {
+	for ev, err := range StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{Thinking: true}, testCfg(srv.URL)) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -719,8 +731,8 @@ func TestStreamChatNon200(t *testing.T) {
 			defer srv.Close()
 
 			var yielded bool
-			for ev, err := range StreamChat(context.Background(), srv.URL,
-				[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
+			for ev, err := range StreamChat(context.Background(),
+				[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}, testCfg(srv.URL)) {
 				yielded = true
 				if err == nil {
 					t.Fatalf("期望错误，却收到事件 %+v", ev)
@@ -752,8 +764,8 @@ func TestStreamChatIsLazy(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	seq := StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{})
+	seq := StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}, testCfg(srv.URL))
 	time.Sleep(100 * time.Millisecond)
 	if n := atomic.LoadInt32(&calls); n != 0 {
 		t.Fatalf("仅构造 seq 就发出了 %d 次请求，期望 0（应完全惰性）", n)
@@ -780,8 +792,8 @@ func TestStreamChatSeqReusable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	seq := StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{})
+	seq := StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{}, testCfg(srv.URL))
 	for i := 1; i <= 2; i++ {
 		var sb strings.Builder
 		for ev, err := range seq {
@@ -829,8 +841,8 @@ func TestStreamChatBreakClosesConnection(t *testing.T) {
 	defer srv.Close()
 
 	n := 0
-	for ev, err := range StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
+	for ev, err := range StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}, testCfg(srv.URL)) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -881,8 +893,8 @@ func TestStreamChatContextCancel(t *testing.T) {
 
 	var gotErr error
 	n := 0
-	for _, err := range StreamChat(ctx, srv.URL,
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
+	for _, err := range StreamChat(ctx,
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}, testCfg(srv.URL)) {
 		if err != nil {
 			gotErr = err
 			break
@@ -902,8 +914,9 @@ func TestStreamChatContextCancel(t *testing.T) {
 // 端点不可达时的错误路径。
 func TestStreamChatUnreachableEndpoint(t *testing.T) {
 	var yielded bool
-	for _, err := range StreamChat(context.Background(), "http://127.0.0.1:1/chat/completions",
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
+	for _, err := range StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{},
+		testCfg("http://127.0.0.1:1/chat/completions")) {
 		yielded = true
 		if err == nil {
 			t.Fatal("期望错误")
@@ -917,8 +930,8 @@ func TestStreamChatUnreachableEndpoint(t *testing.T) {
 // 非法 URL 导致 NewRequestWithContext 失败，错误同样只能通过 yield 报出。
 func TestStreamChatInvalidEndpoint(t *testing.T) {
 	var gotErr error
-	for _, err := range StreamChat(context.Background(), "://not-a-valid-url",
-		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
+	for _, err := range StreamChat(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}, testCfg("://not-a-valid-url")) {
 		if err != nil {
 			gotErr = err
 			break

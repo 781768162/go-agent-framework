@@ -1,6 +1,8 @@
 package apis
 
 import (
+	"go-agent-framework/internal/config"
+
 	"bufio"
 	"bytes"
 	"context"
@@ -13,29 +15,27 @@ import (
 )
 
 const (
-	defaultModel = "deepseek-flash" // = DeepSeek-V4.1-Flash-1017
 	dataPrefix   = "data:"
 	doneSentinel = "[DONE]"
-	apiKey       = "should-read-from-config"
 )
 
 var client *http.Client = initHttpClient()
 
 // 流式对话入口，返回iter.Seq2回调函数用于range
-func StreamChat(ctx context.Context, endpoint string, msgs []Message, opts StreamOptions) iter.Seq2[StreamEvent, error] {
+func StreamChat(ctx context.Context, msgs []Message, opts StreamOptions, cfg config.Config) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
-		reqBody, err := json.Marshal(newChatRequest(msgs, opts))
+		reqBody, err := json.Marshal(newChatRequest(msgs, opts, cfg))
 		if err != nil {
 			yield(StreamEvent{}, err)
 			return
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Endpoint, bytes.NewReader(reqBody))
 		if err != nil {
 			yield(StreamEvent{}, err)
 			return
 		}
-		initStreamReqHeader(req, apiKey) // 初始化Header
+		initStreamReqHeader(req, cfg.APIKey) // 初始化Header
 
 		resp, err := client.Do(req) // 发送请求
 		if err != nil {
@@ -120,7 +120,7 @@ func parseStreamChunk(raw string) (ChatResponseChunk, error) {
 	return chunk, err
 }
 
-func newChatRequest(msgs []Message, opts StreamOptions) ChatRequest {
+func newChatRequest(msgs []Message, opts StreamOptions, cfg config.Config) ChatRequest {
 	thinkingType := thinkingDisabled
 	effort := ""
 	if opts.Thinking {
@@ -129,7 +129,7 @@ func newChatRequest(msgs []Message, opts StreamOptions) ChatRequest {
 	}
 
 	return ChatRequest{ // 初始化reqBody
-		Model:           defaultModel,
+		Model:           cfg.DefaultModel,
 		Messages:        msgs,
 		Stream:          true,
 		Thinking:        &enableThinking{Type: thinkingType},
