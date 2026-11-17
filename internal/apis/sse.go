@@ -22,48 +22,43 @@ const (
 var client *http.Client = initHttpClient()
 
 // 流式对话入口，返回iter.Seq2回调函数用于range
-func StreamChat(ctx context.Context, endpoint string, msgs []Message) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
-		reqBody, err := json.Marshal(ChatRequest{ // 初始化reqBody
-			Model:    defaultModel,
-			Messages: msgs,
-			Stream:   true,
-			Thinking: &enableThinking{Type: "disabled"},
-		})
+func StreamChat(ctx context.Context, endpoint string, msgs []Message, opts StreamOptions) iter.Seq2[StreamEvent, error] {
+	return func(yield func(StreamEvent, error) bool) {
+		reqBody, err := json.Marshal(newChatRequest(msgs, opts))
 		if err != nil {
-			yield("", err)
+			yield(StreamEvent{}, err)
 			return
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
 		if err != nil {
-			yield("", err)
+			yield(StreamEvent{}, err)
 			return
 		}
 		initStreamReqHeader(req, apiKey) // 初始化Header
 
 		resp, err := client.Do(req) // 发送请求
 		if err != nil {
-			yield("", err)
+			yield(StreamEvent{}, err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			errMsg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) // 错误时读取API报错内容
-			yield("", fmt.Errorf("HTTP %d 请求失败: %s", resp.StatusCode, bytes.TrimSpace(errMsg)))
+			yield(StreamEvent{}, fmt.Errorf("HTTP %d 请求失败: %s", resp.StatusCode, bytes.TrimSpace(errMsg)))
 			return
 		}
 
 		if err := handleStream(resp.Body, yield); err != nil {
-			yield("", err)
+			yield(StreamEvent{}, err)
 		}
 	}
 
 }
 
 // 流式解析SSE
-func handleStream(body io.ReadCloser, yield func(string, error) bool) error {
+func handleStream(body io.Reader, yield func(StreamEvent, error) bool) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
@@ -83,13 +78,36 @@ func handleStream(body io.ReadCloser, yield func(string, error) bool) error {
 			return fmt.Errorf("解析 chunk 失败: %w", err)
 		}
 		// 首块只带 role、末块只带 finish_reason，content 均为空
-		if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
+		if len(chunk.Choices) == 0 {
 			continue
 		}
+		choice := chunk.Choices[0]
 
-		if !yield(chunk.Choices[0].Delta.Content, nil) {
-			return nil
+		if choice.Delta.ReasoningContent != "" { // thinking块
+			if !yield(StreamEvent{
+				Kind: EventReasoning,
+				Text: choice.Delta.ReasoningContent,
+			}, nil) {
+				return nil
+			}
 		}
+		if choice.Delta.Content != "" { // 输出块
+			if !yield(StreamEvent{
+				Kind: EventContent,
+				Text: choice.Delta.Content,
+			}, nil) {
+				return nil
+			}
+		}
+		if choice.FinishReason != "" { // 结束块
+			if !yield(StreamEvent{
+				Kind:         EventFinish,
+				FinishReason: choice.FinishReason,
+			}, nil) {
+				return nil
+			}
+		}
+
 	}
 	return scanner.Err()
 }
@@ -100,4 +118,22 @@ func parseStreamChunk(raw string) (ChatResponseChunk, error) {
 
 	err := json.Unmarshal([]byte(raw), &chunk)
 	return chunk, err
+}
+
+func newChatRequest(msgs []Message, opts StreamOptions) ChatRequest {
+	thinkingType := thinkingDisabled
+	effort := ""
+	if opts.Thinking {
+		thinkingType = thinkingEnabled
+		effort = opts.ReasoningEffort
+	}
+
+	return ChatRequest{ // 初始化reqBody
+		Model:           defaultModel,
+		Messages:        msgs,
+		Stream:          true,
+		Thinking:        &enableThinking{Type: thinkingType},
+		ReasoningEffort: effort,
+	}
+
 }

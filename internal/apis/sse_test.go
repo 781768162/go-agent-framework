@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,50 +12,93 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
 // ---------- 测试辅助 ----------
 
-// sseBody 把 SSE 文本包成 handleStream 需要的 io.ReadCloser。
-func sseBody(s string) io.ReadCloser {
-	return io.NopCloser(strings.NewReader(s))
-}
-
-// chunkLine 拼一行 SSE data，content 为增量内容。
-func chunkLine(content string) string {
-	b, _ := json.Marshal(map[string]any{
-		"choices": []map[string]any{
-			{"delta": map[string]string{"content": content}},
-		},
-	})
+// sseLine 构造一行 SSE data。三个增量字段均可选，空串不出现在 JSON 中，
+// 用于模拟 DeepSeek 各种形态的 chunk（首块/思考块/混合块/末块）。
+func sseLine(reasoning, content, finish string) string {
+	delta := map[string]string{}
+	if reasoning != "" {
+		delta["reasoning_content"] = reasoning
+	}
+	if content != "" {
+		delta["content"] = content
+	}
+	choice := map[string]any{"delta": delta}
+	if finish != "" {
+		choice["finish_reason"] = finish
+	}
+	b, _ := json.Marshal(map[string]any{"choices": []any{choice}})
 	return "data: " + string(b) + "\n\n"
 }
 
-// drain 消费 handleStream，返回聚合内容与终止错误。
-func drain(body io.ReadCloser) (string, error) {
+// chunkLine 拼一行只有 content 增量的 SSE data。
+func chunkLine(content string) string {
+	return sseLine("", content, "")
+}
+
+// drain 消费 handleStream，只聚合 EventContent 的文本，返回聚合结果与终止错误。
+func drain(body io.Reader) (string, error) {
 	var sb strings.Builder
-	err := handleStream(body, func(content string, err error) bool {
+	err := handleStream(body, func(ev StreamEvent, err error) bool {
 		if err != nil {
 			// handleStream 的契约是不通过 yield 报错，这里出现即为违约
 			panic(fmt.Sprintf("handleStream 不该用 yield 传错误: %v", err))
 		}
-		sb.WriteString(content)
+		if ev.Kind == EventContent {
+			sb.WriteString(ev.Text)
+		}
 		return true
 	})
 	return sb.String(), err
 }
 
+// drainEvents 消费 handleStream，返回完整事件序列，用于断言 Kind 顺序与携带字段。
+func drainEvents(body io.Reader) ([]StreamEvent, error) {
+	var evs []StreamEvent
+	err := handleStream(body, func(ev StreamEvent, err error) bool {
+		if err != nil {
+			panic(fmt.Sprintf("handleStream 不该用 yield 传错误: %v", err))
+		}
+		evs = append(evs, ev)
+		return true
+	})
+	return evs, err
+}
+
 // ---------- 层 3：parseStreamChunk（纯函数）----------
+
+// String 决定测试失败信息与日志里 %v 的可读性，必须精确。
+func TestEventKindString(t *testing.T) {
+	tests := []struct {
+		kind EventKind
+		want string
+	}{
+		{EventReasoning, "reasoning"},
+		{EventContent, "content"},
+		{EventFinish, "finish"},
+		{EventKind(99), "unknown"}, // 越界值兜底，不能 panic
+	}
+	for _, tt := range tests {
+		if got := tt.kind.String(); got != tt.want {
+			t.Errorf("EventKind(%d).String() = %q, want %q", int(tt.kind), got, tt.want)
+		}
+	}
+}
 
 func TestParseStreamChunk(t *testing.T) {
 	tests := []struct {
-		name        string
-		raw         string
-		wantContent string
-		wantFinish  string
-		wantChoices int
-		wantErr     bool
+		name          string
+		raw           string
+		wantContent   string
+		wantReasoning string
+		wantFinish    string
+		wantChoices   int
+		wantErr       bool
 	}{
 		{
 			name:        "正常增量块",
@@ -67,6 +111,19 @@ func TestParseStreamChunk(t *testing.T) {
 			raw:         `{"choices":[{"delta":{"role":"assistant","content":""},"index":0}]}`,
 			wantContent: "",
 			wantChoices: 1,
+		},
+		{
+			name:          "思考块带 reasoning_content",
+			raw:           `{"choices":[{"delta":{"reasoning_content":"让我想想"},"index":0}]}`,
+			wantReasoning: "让我想想",
+			wantChoices:   1,
+		},
+		{
+			name:          "混合块同时带思考与回答",
+			raw:           `{"choices":[{"delta":{"reasoning_content":"想","content":"答"},"index":0}]}`,
+			wantContent:   "答",
+			wantReasoning: "想",
+			wantChoices:   1,
 		},
 		{
 			name:        "末块带 finish_reason",
@@ -115,6 +172,9 @@ func TestParseStreamChunk(t *testing.T) {
 			}
 			if got := chunk.Choices[0].Delta.Content; got != tt.wantContent {
 				t.Errorf("Content = %q, want %q", got, tt.wantContent)
+			}
+			if got := chunk.Choices[0].Delta.ReasoningContent; got != tt.wantReasoning {
+				t.Errorf("ReasoningContent = %q, want %q", got, tt.wantReasoning)
 			}
 			if got := chunk.Choices[0].FinishReason; got != tt.wantFinish {
 				t.Errorf("FinishReason = %q, want %q", got, tt.wantFinish)
@@ -212,7 +272,7 @@ func TestHandleStream(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := drain(sseBody(tt.body))
+			got, err := drain(strings.NewReader(tt.body))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
 			}
@@ -223,28 +283,159 @@ func TestHandleStream(t *testing.T) {
 	}
 }
 
-// 消费者 break 时 handleStream 必须返回 nil，且不再继续读流。
-func TestHandleStreamBreakIsNotError(t *testing.T) {
-	body := chunkLine("a") + chunkLine("b") + chunkLine("c")
-
-	var n int
-	err := handleStream(sseBody(body), func(string, error) bool {
-		n++
-		return n < 2 // 收到第 2 块就 break
+// 事件序列契约：Kind 的产出顺序固定为 思考 → 回答 → 结束，混合块也不能乱序。
+func TestHandleStreamEvents(t *testing.T) {
+	t.Run("思考流与回答流交替，事件按块序产出", func(t *testing.T) {
+		body := sseLine("思考1", "", "") +
+			sseLine("思考2", "", "") +
+			sseLine("", "回答1", "") +
+			sseLine("", "", "stop") +
+			"data: [DONE]\n\n"
+		evs, err := drainEvents(strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		want := []struct {
+			kind EventKind
+			text string
+		}{
+			{EventReasoning, "思考1"},
+			{EventReasoning, "思考2"},
+			{EventContent, "回答1"},
+			{EventFinish, ""},
+		}
+		if len(evs) != len(want) {
+			t.Fatalf("事件数 = %d, want %d: %+v", len(evs), len(want), evs)
+		}
+		for i, w := range want {
+			if evs[i].Kind != w.kind {
+				t.Fatalf("evs[%d].Kind = %v, want %v（全序列: %v）", i, evs[i].Kind, w.kind, evs)
+			}
+			if evs[i].Text != w.text {
+				t.Errorf("evs[%d].Text = %q, want %q", i, evs[i].Text, w.text)
+			}
+		}
 	})
-	if err != nil {
-		t.Fatalf("break 不该产生错误: %v", err)
-	}
-	if n != 2 {
-		t.Fatalf("yield 被调了 %d 次, want 2（第 3 块不该被读取）", n)
-	}
+
+	t.Run("同一 chunk 同时带思考与回答，先产出 reasoning 再产出 content", func(t *testing.T) {
+		evs, err := drainEvents(strings.NewReader(sseLine("先想", "后答", "") + "data: [DONE]\n\n"))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(evs) != 2 {
+			t.Fatalf("事件数 = %d, want 2（混合块必须产出两个事件）: %+v", len(evs), evs)
+		}
+		if evs[0].Kind != EventReasoning || evs[0].Text != "先想" {
+			t.Errorf("evs[0] = %+v, want reasoning/先想", evs[0])
+		}
+		if evs[1].Kind != EventContent || evs[1].Text != "后答" {
+			t.Errorf("evs[1] = %+v, want content/后答", evs[1])
+		}
+	})
+
+	t.Run("finish 事件携带 FinishReason，Text 必须为空", func(t *testing.T) {
+		evs, err := drainEvents(strings.NewReader(sseLine("", "", "content_filter") + "data: [DONE]\n\n"))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(evs) != 1 || evs[0].Kind != EventFinish {
+			t.Fatalf("evs = %+v, want 单个 finish 事件", evs)
+		}
+		if evs[0].FinishReason != "content_filter" {
+			t.Errorf("FinishReason = %q, want content_filter", evs[0].FinishReason)
+		}
+		if evs[0].Text != "" {
+			t.Errorf("finish 事件的 Text = %q, want 空（finish_reason 不是文本）", evs[0].Text)
+		}
+	})
+
+	t.Run("纯思考流不产出任何 content 事件", func(t *testing.T) {
+		evs, err := drainEvents(strings.NewReader(
+			sseLine("只思考", "", "") + sseLine("", "", "length") + "data: [DONE]\n\n"))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(evs) != 2 {
+			t.Fatalf("事件数 = %d, want 2: %+v", len(evs), evs)
+		}
+		for _, ev := range evs {
+			if ev.Kind == EventContent {
+				t.Fatalf("纯思考流不该产出 content 事件: %+v", ev)
+			}
+		}
+	})
+
+	t.Run("role 首块与空 choices 块不产出事件", func(t *testing.T) {
+		body := `data: {"choices":[{"delta":{"role":"assistant","content":""}}]}` + "\n\n" +
+			`data: {"choices":[]}` + "\n\n" +
+			"data: [DONE]\n\n"
+		evs, err := drainEvents(strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(evs) != 0 {
+			t.Fatalf("evs = %+v, want 空", evs)
+		}
+	})
+}
+
+// 消费者 break 时 handleStream 必须返回 nil，且不再继续读流。
+// 三处 yield 点（思考/回答/结束）任何一处收到 false 都必须立即停。
+func TestHandleStreamBreakIsNotError(t *testing.T) {
+	t.Run("回答事件后 break", func(t *testing.T) {
+		body := chunkLine("a") + chunkLine("b") + chunkLine("c")
+
+		var n int
+		err := handleStream(strings.NewReader(body), func(StreamEvent, error) bool {
+			n++
+			return n < 2 // 收到第 2 块就 break
+		})
+		if err != nil {
+			t.Fatalf("break 不该产生错误: %v", err)
+		}
+		if n != 2 {
+			t.Fatalf("yield 被调了 %d 次, want 2（第 3 块不该被读取）", n)
+		}
+	})
+
+	t.Run("思考事件就 break，不再读到回答", func(t *testing.T) {
+		body := sseLine("思考", "", "") + chunkLine("答案") + "data: [DONE]\n\n"
+
+		var kinds []EventKind
+		err := handleStream(strings.NewReader(body), func(ev StreamEvent, err error) bool {
+			kinds = append(kinds, ev.Kind)
+			return false // 第一个事件就 break
+		})
+		if err != nil {
+			t.Fatalf("break 不该产生错误: %v", err)
+		}
+		if len(kinds) != 1 || kinds[0] != EventReasoning {
+			t.Fatalf("kinds = %v, want 仅 [reasoning]", kinds)
+		}
+	})
+
+	t.Run("结束事件后 break", func(t *testing.T) {
+		body := sseLine("", "", "stop") + chunkLine("不该出现")
+
+		var n int
+		err := handleStream(strings.NewReader(body), func(StreamEvent, error) bool {
+			n++
+			return false
+		})
+		if err != nil {
+			t.Fatalf("break 不该产生错误: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("yield 被调了 %d 次, want 1", n)
+		}
+	})
 }
 
 // 边界值：行长恰好跨越 scanner 缓冲区上限。
 func TestHandleStreamLineLengthBoundary(t *testing.T) {
 	t.Run("100KB 行在上限内，应正常解析", func(t *testing.T) {
 		big := strings.Repeat("a", 100*1024)
-		got, err := drain(sseBody(chunkLine(big) + "data: [DONE]\n\n"))
+		got, err := drain(strings.NewReader(chunkLine(big) + "data: [DONE]\n\n"))
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
@@ -255,7 +446,7 @@ func TestHandleStreamLineLengthBoundary(t *testing.T) {
 
 	t.Run("2MB 行超过上限，应报 ErrTooLong 而非静默截断", func(t *testing.T) {
 		big := strings.Repeat("a", 2*1024*1024)
-		_, err := drain(sseBody(chunkLine(big) + "data: [DONE]\n\n"))
+		_, err := drain(strings.NewReader(chunkLine(big) + "data: [DONE]\n\n"))
 		if err == nil {
 			t.Fatal("期望超长行报错，实际 err = nil")
 		}
@@ -295,7 +486,42 @@ func (r *errReader) Read(p []byte) (int, error) {
 	return 0, r.err
 }
 
-func (r *errReader) Close() error { return nil }
+// 标准库 iotest 提供的边界 reader。这些是签名收成 io.Reader 之后才用得上的：
+// 它们验证解析不依赖"一次 Read 就读满整行"这类隐含假设。
+func TestHandleStreamReaderBoundaries(t *testing.T) {
+	body := chunkLine("hello") + chunkLine(" world") + "data: [DONE]\n\n"
+
+	t.Run("HalfReader：每次只返回请求量的一半（短读）", func(t *testing.T) {
+		got, err := drain(iotest.HalfReader(strings.NewReader(body)))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "hello world" {
+			t.Fatalf("got %q, want %q", got, "hello world")
+		}
+	})
+
+	t.Run("DataErrReader：最后一批数据与 EOF 在同一次 Read 返回", func(t *testing.T) {
+		got, err := drain(iotest.DataErrReader(strings.NewReader(body)))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "hello world" {
+			t.Fatalf("got %q, want %q", got, "hello world")
+		}
+	})
+
+	t.Run("ErrReader：所有 Read 都失败", func(t *testing.T) {
+		wantErr := errors.New("boom")
+		_, err := drain(iotest.ErrReader(wantErr))
+		if err == nil {
+			t.Fatal("期望错误，实际 err = nil")
+		}
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, 期望能 errors.Is 到 %v", err, wantErr)
+		}
+	})
+}
 
 // ---------- 层 1：StreamChat ----------
 
@@ -324,12 +550,14 @@ func TestStreamChatRequestContract(t *testing.T) {
 	defer srv.Close()
 
 	var sb strings.Builder
-	for content, err := range StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "ping"}}) {
+	for ev, err := range StreamChat(context.Background(), srv.URL,
+		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{}) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		sb.WriteString(content)
+		if ev.Kind == EventContent {
+			sb.WriteString(ev.Text)
+		}
 	}
 	if sb.String() != "pong" {
 		t.Fatalf("聚合结果 = %q, want %q", sb.String(), "pong")
@@ -355,7 +583,8 @@ func TestStreamChatRequestContract(t *testing.T) {
 	if !c.req.Stream {
 		t.Error("Stream = false, 流式请求必须为 true")
 	}
-	// V4.1 flash 思考模式默认开启，必须显式关闭，否则前半段全是 reasoning_content
+	// V4.1 flash 思考模式默认开启，零值 opts 必须显式关闭，
+	// 否则前半段全是 reasoning_content
 	if c.req.Thinking == nil {
 		t.Fatal("Thinking 字段缺失，思考模式不会被关闭")
 	}
@@ -367,6 +596,105 @@ func TestStreamChatRequestContract(t *testing.T) {
 	}
 	if c.req.Messages[0].Role != "user" || c.req.Messages[0].Content != "ping" {
 		t.Errorf("Messages[0] = %+v", c.req.Messages[0])
+	}
+}
+
+// opts 到请求体的翻译契约：思考开关、effort 与 thinking 的耦合、omitempty。
+// 字段缺失必须用原始 JSON 断言——unmarshal 之后空串与字段缺失无法区分。
+func TestStreamChatRequestThinkingContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		opts       StreamOptions
+		wantType   string
+		wantEffort string // "" 表示该字段必须不出现
+	}{
+		{"零值：思考关闭", StreamOptions{}, "disabled", ""},
+		{"开启思考不给 effort，交给服务端默认", StreamOptions{Thinking: true}, "enabled", ""},
+		{"开启思考并指定 effort", StreamOptions{Thinking: true, ReasoningEffort: "low"}, "enabled", "low"},
+		{"关闭思考但给了 effort：必须被忽略", StreamOptions{ReasoningEffort: "low"}, "disabled", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			type captured struct {
+				body string
+			}
+			got := make(chan captured, 1)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				got <- captured{body: string(b)}
+
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer srv.Close()
+
+			for _, err := range StreamChat(context.Background(), srv.URL,
+				[]Message{{Role: "user", Content: "hi"}}, tt.opts) {
+				if err != nil {
+					t.Fatalf("unexpected err: %v", err)
+				}
+			}
+
+			c := <-got
+			var cr ChatRequest
+			if err := json.Unmarshal([]byte(c.body), &cr); err != nil {
+				t.Fatalf("请求体不是合法 JSON: %v (%s)", err, c.body)
+			}
+
+			if cr.Thinking == nil {
+				t.Fatalf("thinking 字段缺失: %s", c.body)
+			}
+			if cr.Thinking.Type != tt.wantType {
+				t.Errorf("thinking.type = %q, want %q（原始: %s）", cr.Thinking.Type, tt.wantType, c.body)
+			}
+
+			if tt.wantEffort == "" {
+				if strings.Contains(c.body, "reasoning_effort") {
+					t.Errorf("reasoning_effort 不该出现在请求体中: %s", c.body)
+				}
+			} else if !strings.Contains(c.body, `"reasoning_effort":"`+tt.wantEffort+`"`) {
+				t.Errorf("reasoning_effort 缺失或值不对, want %q（原始: %s）", tt.wantEffort, c.body)
+			}
+		})
+	}
+}
+
+// 端到端：开启思考后，事件序列应为 思考… → 回答… → 结束，且中途无错误。
+func TestStreamChatThinkingFlow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`+"\n\n")
+		fmt.Fprint(w, sseLine("思考A", "", ""))
+		fmt.Fprint(w, sseLine("思考B", "", ""))
+		fmt.Fprint(w, sseLine("", "回答1", ""))
+		fmt.Fprint(w, sseLine("", "回答2", ""))
+		fmt.Fprint(w, sseLine("", "", "stop"))
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	var evs []StreamEvent
+	for ev, err := range StreamChat(context.Background(), srv.URL,
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{Thinking: true}) {
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		evs = append(evs, ev)
+	}
+
+	wantKinds := []EventKind{EventReasoning, EventReasoning, EventContent, EventContent, EventFinish}
+	if len(evs) != len(wantKinds) {
+		t.Fatalf("事件数 = %d, want %d: %+v", len(evs), len(wantKinds), evs)
+	}
+	for i, want := range wantKinds {
+		if evs[i].Kind != want {
+			t.Fatalf("evs[%d].Kind = %v, want %v（全序列: %v）", i, evs[i].Kind, want, evs)
+		}
+	}
+	if last := evs[len(evs)-1]; last.FinishReason != "stop" {
+		t.Errorf("最后事件 FinishReason = %q, want stop", last.FinishReason)
 	}
 }
 
@@ -391,11 +719,11 @@ func TestStreamChatNon200(t *testing.T) {
 			defer srv.Close()
 
 			var yielded bool
-			for content, err := range StreamChat(context.Background(), srv.URL,
-				[]Message{{Role: "user", Content: "hi"}}) {
+			for ev, err := range StreamChat(context.Background(), srv.URL,
+				[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
 				yielded = true
 				if err == nil {
-					t.Fatalf("期望错误，却收到 content = %q", content)
+					t.Fatalf("期望错误，却收到事件 %+v", ev)
 				}
 				if !strings.Contains(err.Error(), fmt.Sprint(tt.status)) {
 					t.Errorf("错误 %q 不含状态码 %d", err, tt.status)
@@ -403,8 +731,8 @@ func TestStreamChatNon200(t *testing.T) {
 				if !strings.Contains(err.Error(), tt.body) {
 					t.Errorf("错误 %q 不含响应体片段 %q", err, tt.body)
 				}
-				if content != "" {
-					t.Errorf("出错时 content 应为零值，实际 %q", content)
+				if ev != (StreamEvent{}) {
+					t.Errorf("出错时事件应为零值，实际 %+v", ev)
 				}
 			}
 			if !yielded {
@@ -424,7 +752,8 @@ func TestStreamChatIsLazy(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	seq := StreamChat(context.Background(), srv.URL, []Message{{Role: "user", Content: "hi"}})
+	seq := StreamChat(context.Background(), srv.URL,
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{})
 	time.Sleep(100 * time.Millisecond)
 	if n := atomic.LoadInt32(&calls); n != 0 {
 		t.Fatalf("仅构造 seq 就发出了 %d 次请求，期望 0（应完全惰性）", n)
@@ -451,14 +780,17 @@ func TestStreamChatSeqReusable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	seq := StreamChat(context.Background(), srv.URL, []Message{{Role: "user", Content: "ping"}})
+	seq := StreamChat(context.Background(), srv.URL,
+		[]Message{{Role: "user", Content: "ping"}}, StreamOptions{})
 	for i := 1; i <= 2; i++ {
 		var sb strings.Builder
-		for content, err := range seq {
+		for ev, err := range seq {
 			if err != nil {
 				t.Fatalf("第 %d 次消费: %v", i, err)
 			}
-			sb.WriteString(content)
+			if ev.Kind == EventContent {
+				sb.WriteString(ev.Text)
+			}
 		}
 		if sb.String() != "pong" {
 			t.Fatalf("第 %d 次消费得到 %q, want pong", i, sb.String())
@@ -497,13 +829,13 @@ func TestStreamChatBreakClosesConnection(t *testing.T) {
 	defer srv.Close()
 
 	n := 0
-	for content, err := range StreamChat(context.Background(), srv.URL,
-		[]Message{{Role: "user", Content: "hi"}}) {
+	for ev, err := range StreamChat(context.Background(), srv.URL,
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		if content != "x" {
-			t.Fatalf("content = %q, want x", content)
+		if ev.Kind != EventContent || ev.Text != "x" {
+			t.Fatalf("ev = %+v, want content/x", ev)
 		}
 		n++
 		if n == 3 {
@@ -549,7 +881,8 @@ func TestStreamChatContextCancel(t *testing.T) {
 
 	var gotErr error
 	n := 0
-	for _, err := range StreamChat(ctx, srv.URL, []Message{{Role: "user", Content: "hi"}}) {
+	for _, err := range StreamChat(ctx, srv.URL,
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
 		if err != nil {
 			gotErr = err
 			break
@@ -570,7 +903,7 @@ func TestStreamChatContextCancel(t *testing.T) {
 func TestStreamChatUnreachableEndpoint(t *testing.T) {
 	var yielded bool
 	for _, err := range StreamChat(context.Background(), "http://127.0.0.1:1/chat/completions",
-		[]Message{{Role: "user", Content: "hi"}}) {
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
 		yielded = true
 		if err == nil {
 			t.Fatal("期望错误")
@@ -585,7 +918,7 @@ func TestStreamChatUnreachableEndpoint(t *testing.T) {
 func TestStreamChatInvalidEndpoint(t *testing.T) {
 	var gotErr error
 	for _, err := range StreamChat(context.Background(), "://not-a-valid-url",
-		[]Message{{Role: "user", Content: "hi"}}) {
+		[]Message{{Role: "user", Content: "hi"}}, StreamOptions{}) {
 		if err != nil {
 			gotErr = err
 			break
