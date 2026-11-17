@@ -3,8 +3,9 @@ package apis
 // 请求
 
 type Message struct {
-	Role    string `json:"role"` // "system" / "user" / "assistant"
-	Content string `json:"content"`
+	Role             string `json:"role"` // "system" / "user" / "assistant"
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type enableThinking struct {
