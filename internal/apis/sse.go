@@ -125,21 +125,3 @@ func parseStreamChunk(raw string) (ChatResponseChunk, error) {
 	err := json.Unmarshal([]byte(raw), &chunk)
 	return chunk, err
 }
-
-func newChatRequest(msgs []Message, opts StreamOptions, cfg config.Config) ChatRequest {
-	thinkingType := thinkingDisabled
-	effort := ""
-	if opts.Thinking {
-		thinkingType = thinkingEnabled
-		effort = opts.ReasoningEffort
-	}
-
-	return ChatRequest{ // 初始化reqBody
-		Model:           cfg.DefaultModel,
-		Messages:        msgs,
-		Stream:          true,
-		Thinking:        &enableThinking{Type: thinkingType},
-		ReasoningEffort: effort,
-	}
-
-}

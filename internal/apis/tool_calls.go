@@ -1,8 +1,11 @@
 package apis
 
 import (
-	"slices"
+	"encoding/json"
+	"fmt"
 	"maps"
+	"slices"
+	"strings"
 )
 
 type ToolCall struct {
@@ -46,13 +49,40 @@ func (b toolCallBuffer) merge(deltas []toolCallDelta) {
 func (b toolCallBuffer) getCalls() []ToolCall {
 	calls := make([]ToolCall, 0, len(b))
 	for _, index := range slices.Sorted(maps.Keys(b)) {
-        calls = append(calls, b[index])
-    }
+		calls = append(calls, b[index])
+	}
 
 	return calls
 }
 
 func CheckToolCalls(calls []ToolCall) error {
-	// TODO
+	if len(calls) == 0 {
+		return fmt.Errorf("模型请求调用工具，但调用列表为空")
+	}
+
+	checkedIds := make(map[string]struct{}, len(calls))
+	for i, call := range calls {
+		if strings.TrimSpace(call.Id) == "" {
+			return fmt.Errorf("第 %d 工具缺少ID", i+1)
+		}
+		if _, ok := checkedIds[call.Id]; ok {
+			return fmt.Errorf("工具ID %s 重复", call.Id)
+		}
+
+		checkedIds[call.Id] = struct{}{}
+
+		if call.Type != "function" {
+			return fmt.Errorf("工具调用 %s 的类型无效：%q", call.Id, call.Type)
+		}
+		if strings.TrimSpace(call.Function.Name) == "" {
+			return fmt.Errorf("工具调用 %s 缺少函数名", call.Id)
+		}
+
+		args := strings.TrimSpace(call.Function.Args)
+		if !strings.HasPrefix(args, "{") || !json.Valid([]byte(args)) {
+			return fmt.Errorf("工具调用 %s 的参数必须是 JSON 对象", call.Id)
+		}
+	}
+
 	return nil
 }

@@ -10,7 +10,7 @@ type Message struct {
 	Content          string
 	ReasoningContent string
 	ToolCalls        string
-	ToolCallId       int
+	ToolCallId       string
 }
 
 type ApiCall struct {

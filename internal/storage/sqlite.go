@@ -83,15 +83,21 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 	}
 	defer tx.Rollback()
 
+	if msg.ToolCalls == "" {
+		msg.ToolCalls = "[]"
+	}
+
 	if _, err = tx.ExecContext(
 		ctx,
 		`INSERT INTO messages 
-		(session_id, role, content, reasoning_content)
-		VALUES (?, ?, ?, ?);`,
+		(session_id, role, content, reasoning_content, tool_calls, tool_call_id)
+		VALUES (?, ?, ?, ?, ?, ?);`,
 		msg.SessionId,
 		msg.Role,
 		msg.Content,
 		msg.ReasoningContent,
+		msg.ToolCalls,
+		msg.ToolCallId,
 	); err != nil {
 		return fmt.Errorf("插入 messages 失败: %w", err)
 	}
@@ -125,7 +131,7 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 func QueryMessages(ctx context.Context, db *sql.DB, sessionId int64) ([]Message, error) {
 	rows, err := db.QueryContext(
 		ctx,
-		`SELECT role, content, reasoning_content
+		`SELECT role, content, reasoning_content, tool_calls, tool_call_id
 		FROM messages
 		WHERE session_id = ?
 		ORDER BY id;`,
@@ -140,7 +146,13 @@ func QueryMessages(ctx context.Context, db *sql.DB, sessionId int64) ([]Message,
 	for rows.Next() {
 		msg := Message{SessionId: sessionId}
 
-		if err := rows.Scan(&msg.Role, &msg.Content, &msg.ReasoningContent); err != nil {
+		if err := rows.Scan(
+			&msg.Role,
+			&msg.Content,
+			&msg.ReasoningContent,
+			&msg.ToolCalls,
+			&msg.ToolCallId,
+		); err != nil {
 			return nil, fmt.Errorf("查询 messages 失败: %w", err)
 		}
 

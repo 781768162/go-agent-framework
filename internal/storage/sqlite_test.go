@@ -71,6 +71,9 @@ func TestOpenPreservesHistory(t *testing.T) {
 		t.Fatalf("会话标题 = %q，预期为 %q", gotTitle, title)
 	}
 
+	for i := range want {
+		want[i].ToolCalls = "[]"
+	}
 	assertMessages(t, reopened, sessionID, want)
 }
 
@@ -152,6 +155,9 @@ func TestQueryMessagesBySession(t *testing.T) {
 		}
 	}
 
+	first.ToolCalls = "[]"
+	second.ToolCalls = "[]"
+	reply.ToolCalls = "[]"
 	assertMessages(t, db, firstID, []storage.Message{first, reply})
 	assertMessages(t, db, secondID, []storage.Message{second})
 }

@@ -3,9 +3,11 @@ package apis
 // 请求
 
 type Message struct {
-	Role             string `json:"role"` // "system" / "user" / "assistant"
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role"` // "system" / "user" / "assistant"
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallId       string     `json:"tool_call_id,omitempty"`
 }
 
 type enableThinking struct {
@@ -20,6 +22,7 @@ const (
 type StreamOptions struct {
 	Thinking        bool
 	ReasoningEffort string // "low" / "high" / "max"
+	Tools           []Tool
 }
 
 type EventKind int // 用于标识输出流类型
@@ -46,6 +49,16 @@ func (k EventKind) String() string {
 	}
 }
 
+type Tool struct {
+	Type     string      `json:"type"`
+	Function FunctionDef `json:"function"`
+}
+
+type FunctionDef struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 // 流式事件
 type StreamEvent struct {
 	Kind         EventKind
@@ -60,6 +73,7 @@ type ChatRequest struct {
 	Stream          bool            `json:"stream"`
 	Thinking        *enableThinking `json:"thinking,omitzero"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Tools           []Tool          `json:"tools,omitempty"`
 }
 
 // 响应
