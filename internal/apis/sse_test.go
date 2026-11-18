@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,6 +80,13 @@ func drainEvents(body io.Reader) ([]StreamEvent, error) {
 		return true
 	})
 	return evs, err
+}
+
+func equalStreamEvent(got, want StreamEvent) bool {
+	return got.Kind == want.Kind &&
+		got.Text == want.Text &&
+		got.FinishReason == want.FinishReason &&
+		slices.Equal(got.ToolCalls, want.ToolCalls)
 }
 
 // ---------- 层 3：parseStreamChunk（纯函数）----------
@@ -381,7 +389,7 @@ func TestHandleStreamEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if len(evs) != 1 || evs[0] != (StreamEvent{Kind: EventDone}) {
+		if len(evs) != 1 || !equalStreamEvent(evs[0], StreamEvent{Kind: EventDone}) {
 			t.Fatalf("事件序列 = %+v，预期只有流结束事件", evs)
 		}
 	})
@@ -393,8 +401,8 @@ func TestHandleStreamEvents(t *testing.T) {
 			t.Fatalf("读取流失败: %v", err)
 		}
 
-		if len(evs) != 2 || evs[0] != (StreamEvent{Kind: EventContent, Text: "半截回复"}) ||
-			evs[1] != (StreamEvent{Kind: EventFinish, FinishReason: "stop"}) {
+		if len(evs) != 2 || !equalStreamEvent(evs[0], StreamEvent{Kind: EventContent, Text: "半截回复"}) ||
+			!equalStreamEvent(evs[1], StreamEvent{Kind: EventFinish, FinishReason: "stop"}) {
 			t.Fatalf("事件序列 = %+v，预期只有正文和停止原因", evs)
 		}
 	})
@@ -753,7 +761,7 @@ func TestStreamChatNon200(t *testing.T) {
 				if !strings.Contains(err.Error(), tt.body) {
 					t.Errorf("错误 %q 不含响应体片段 %q", err, tt.body)
 				}
-				if ev != (StreamEvent{}) {
+				if !equalStreamEvent(ev, StreamEvent{}) {
 					t.Errorf("出错时事件应为零值，实际 %+v", ev)
 				}
 			}

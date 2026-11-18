@@ -36,6 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// 对话轮次循环
 	for scanner.Scan() { // 读取stdin流
 		input := scanner.Text()
 		if strings.TrimSpace(input) == "" {
@@ -48,7 +49,7 @@ func main() {
 		}
 		msgs = append(msgs, msg)
 		msgStorage := storage.Message{
-			SessionID: sessionId,
+			SessionId: sessionId,
 			Role:      "user",
 			Content:   input,
 		}
@@ -58,7 +59,8 @@ func main() {
 		}
 
 		var output, reasoningOutput strings.Builder
-		done := false
+		var calls []apis.ToolCall
+		done := false // 标识本轮是否输出完毕，流结束不代表轮次结束
 		for event, err := range apis.StreamChat(ctx, msgs, opts, cfg) { // 解析sse流
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "流式对话失败:", err)
@@ -72,10 +74,19 @@ func main() {
 				//fmt.Printf("Deepseek: %s \n", event.Text)
 				output.WriteString(event.Text)
 			case apis.EventFinish:
+				if event.FinishReason == "tool_calls" {
+					calls = event.ToolCalls
+				}
 				fmt.Printf("轮次结束原因: %s \n", event.FinishReason)
 			case apis.EventDone:
 				done = true
 				fmt.Printf("会话轮次结束\n")
+			}
+		}
+		if done && len(calls) > 0 {
+			if err := apis.CheckToolCalls(calls); err != nil {
+				fmt.Fprintln(os.Stderr, "工具调用校验失败", err)
+				continue
 			}
 		}
 
@@ -87,7 +98,7 @@ func main() {
 			}
 			msgs = append(msgs, msg)
 			msgStorage = storage.Message{
-				SessionID:        sessionId,
+				SessionId:        sessionId,
 				Role:             "assistant",
 				Content:          output.String(),
 				ReasoningContent: reasoningOutput.String(),

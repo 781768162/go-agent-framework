@@ -51,6 +51,7 @@ type StreamEvent struct {
 	Kind         EventKind
 	Text         string
 	FinishReason string
+	ToolCalls    []ToolCall
 }
 
 type ChatRequest struct {
@@ -64,11 +65,11 @@ type ChatRequest struct {
 // 响应
 
 type delta struct {
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	ReasoningContent string          `json:"reasoning_content"`
+	ToolCalls        []toolCallDelta `json:"tool_calls"`
 }
-
 type ChatResponseChunk struct {
 	Choices []struct {
 		Delta        delta  `json:"delta"`

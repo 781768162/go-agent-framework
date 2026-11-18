@@ -88,7 +88,7 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 		`INSERT INTO messages 
 		(session_id, role, content, reasoning_content)
 		VALUES (?, ?, ?, ?);`,
-		msg.SessionID,
+		msg.SessionId,
 		msg.Role,
 		msg.Content,
 		msg.ReasoningContent,
@@ -101,7 +101,7 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 		`UPDATE sessions
 		SET updated_at = datetime('now')
 		WHERE id = ?;`,
-		msg.SessionID,
+		msg.SessionId,
 	)
 	if err != nil {
 		return fmt.Errorf("插入 messages 失败: %w", err)
@@ -111,7 +111,7 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 		return fmt.Errorf("插入 messages 失败: %w", err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("会话 %d 不存在", affected)
+		return fmt.Errorf("会话 %d 不存在", msg.SessionId)
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -138,7 +138,7 @@ func QueryMessages(ctx context.Context, db *sql.DB, sessionId int64) ([]Message,
 
 	var msgs []Message
 	for rows.Next() {
-		msg := Message{SessionID: sessionId}
+		msg := Message{SessionId: sessionId}
 
 		if err := rows.Scan(&msg.Role, &msg.Content, &msg.ReasoningContent); err != nil {
 			return nil, fmt.Errorf("查询 messages 失败: %w", err)

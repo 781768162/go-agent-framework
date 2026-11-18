@@ -5,7 +5,7 @@ type Session struct {
 }
 
 type Message struct {
-	SessionID        int64
+	SessionId        int64
 	Role             string
 	Content          string
 	ReasoningContent string
@@ -14,7 +14,7 @@ type Message struct {
 }
 
 type ApiCall struct {
-	SessionID             int
+	SessionId             int
 	Model                 string
 	Thinking              int
 	PromptTokens          int

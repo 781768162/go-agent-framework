@@ -62,6 +62,7 @@ func handleStream(body io.Reader, yield func(StreamEvent, error) bool) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
+	callsBuffer := make(toolCallBuffer)
 	for scanner.Scan() {
 		data, ok := strings.CutPrefix(scanner.Text(), dataPrefix)
 		if !ok {
@@ -100,10 +101,14 @@ func handleStream(body io.Reader, yield func(StreamEvent, error) bool) error {
 				return nil
 			}
 		}
+		if len(choice.Delta.ToolCalls) > 0 { // 工具调用块
+			callsBuffer.merge(choice.Delta.ToolCalls)
+		}
 		if choice.FinishReason != "" { // 结束块
 			if !yield(StreamEvent{
 				Kind:         EventFinish,
 				FinishReason: choice.FinishReason,
+				ToolCalls:    callsBuffer.getCalls(),
 			}, nil) {
 				return nil
 			}

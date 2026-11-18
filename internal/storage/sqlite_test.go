@@ -48,8 +48,8 @@ func TestOpenPreservesHistory(t *testing.T) {
 	title := "SAISON 的 'SQLite' 会话"
 	sessionID := createTestSession(t, db, title)
 	want := []storage.Message{
-		{SessionID: sessionID, Role: "user", Content: "这条消息能重开后读到吗？"},
-		{SessionID: sessionID, Role: "assistant", Content: "可以。", ReasoningContent: "验证重开后的消息"},
+		{SessionId: sessionID, Role: "user", Content: "这条消息能重开后读到吗？"},
+		{SessionId: sessionID, Role: "assistant", Content: "可以。", ReasoningContent: "验证重开后的消息"},
 	}
 	for _, msg := range want {
 		if err := storage.CreateMessage(t.Context(), db, msg); err != nil {
@@ -143,9 +143,9 @@ func TestQueryMessagesBySession(t *testing.T) {
 
 	assertMessages(t, db, firstID, nil)
 
-	first := storage.Message{SessionID: firstID, Role: "user", Content: "你好，'SAISON'\n第二行"}
-	second := storage.Message{SessionID: secondID, Role: "user", Content: "另一条会话"}
-	reply := storage.Message{SessionID: firstID, Role: "assistant", Content: "收到。", ReasoningContent: "思考内容"}
+	first := storage.Message{SessionId: firstID, Role: "user", Content: "你好，'SAISON'\n第二行"}
+	second := storage.Message{SessionId: secondID, Role: "user", Content: "另一条会话"}
+	reply := storage.Message{SessionId: firstID, Role: "assistant", Content: "收到。", ReasoningContent: "思考内容"}
 	for _, msg := range []storage.Message{first, second, reply} {
 		if err := storage.CreateMessage(t.Context(), db, msg); err != nil {
 			t.Fatal(err)
@@ -167,7 +167,7 @@ func TestCreateMessageUpdatesSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := storage.CreateMessage(t.Context(), db, storage.Message{
-		SessionID: sessionID,
+		SessionId: sessionID,
 		Role:      "user",
 		Content:   "新消息",
 	}); err != nil {
@@ -190,7 +190,7 @@ func TestCreateMessageRollsBackForMissingSession(t *testing.T) {
 	const missingSessionID int64 = 42
 
 	err := storage.CreateMessage(t.Context(), db, storage.Message{
-		SessionID: missingSessionID,
+		SessionId: missingSessionID,
 		Role:      "user",
 		Content:   "应随事务回滚的消息",
 	})
