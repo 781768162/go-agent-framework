@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"go-agent-framework/internal/apis"
 	"go-agent-framework/internal/config"
+	"go-agent-framework/internal/storage"
 )
 
 func main() {
@@ -15,33 +18,90 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	ctx := context.Background()
-	msg1 := apis.Message{
-		Role:    "user",
-		Content: "你好，Deepseek！",
-	}
-	msg2 := apis.Message{
-		Role:    "user",
-		Content: "这里是来自go-agent-framework的问候！",
-	}
-	msgs := []apis.Message{msg1, msg2}
 	opts := apis.StreamOptions{
 		Thinking:        true,
 		ReasoningEffort: "low",
 	}
-	for event, err := range apis.StreamChat(ctx, msgs, opts, cfg) {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "流式对话失败:", err)
-			return
+	msgs := []apis.Message{}
+	scanner := bufio.NewScanner(os.Stdin)
+	db, err := storage.Open(ctx, "agent.db") // 初始化数据库连接
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	sessionId, err := storage.CreateSession(ctx, db, "test") // 创建session记录
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for scanner.Scan() { // 读取stdin流
+		input := scanner.Text()
+		if strings.TrimSpace(input) == "" {
+			fmt.Println("输入为空")
+			continue
 		}
-		switch event.Kind {
-		case apis.EventReasoning:
-			fmt.Printf("[Thinking] %s \n", event.Text)
-		case apis.EventContent:
-			fmt.Printf("Deepseek: %s \n", event.Text)
-		case apis.EventFinish:
-			fmt.Printf("会话流结束，原因: %s", event.FinishReason)
+		msg := apis.Message{
+			Role:    "user",
+			Content: input,
+		}
+		msgs = append(msgs, msg)
+		msgStorage := storage.Message{
+			SessionID: sessionId,
+			Role:      "user",
+			Content:   input,
+		}
+		if err := storage.CreateMessage(ctx, db, msgStorage); err != nil { // 储存用户输入
+			fmt.Fprintln(os.Stderr, "储存出错: ", err)
+			break
+		}
+
+		var output, reasoningOutput strings.Builder
+		done := false
+		for event, err := range apis.StreamChat(ctx, msgs, opts, cfg) { // 解析sse流
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "流式对话失败:", err)
+				return
+			}
+			switch event.Kind {
+			case apis.EventReasoning:
+				//fmt.Printf("[Thinking] %s \n", event.Text)
+				reasoningOutput.WriteString(event.Text)
+			case apis.EventContent:
+				//fmt.Printf("Deepseek: %s \n", event.Text)
+				output.WriteString(event.Text)
+			case apis.EventFinish:
+				fmt.Printf("轮次结束原因: %s \n", event.FinishReason)
+			case apis.EventDone:
+				done = true
+				fmt.Printf("会话轮次结束\n")
+			}
+		}
+
+		if done && (output.Len() > 0 || reasoningOutput.Len() > 0) {
+			msg = apis.Message{
+				Role:             "assistant",
+				Content:          output.String(),
+				ReasoningContent: reasoningOutput.String(),
+			}
+			msgs = append(msgs, msg)
+			msgStorage = storage.Message{
+				SessionID:        sessionId,
+				Role:             "assistant",
+				Content:          output.String(),
+				ReasoningContent: reasoningOutput.String(),
+			}
+			if err := storage.CreateMessage(ctx, db, msgStorage); err != nil { // 储存模型输出
+				fmt.Fprintln(os.Stderr, "储存出错: ", err)
+				break
+			}
+			fmt.Printf("[think] %s [/think]\n", reasoningOutput.String())
+			fmt.Printf("Deepseek: %s\n", output.String())
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		log.Fatal(fmt.Errorf("输入流出错: %w", err))
+	}
+
 }

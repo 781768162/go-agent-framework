@@ -92,6 +92,7 @@ func TestEventKindString(t *testing.T) {
 		{EventReasoning, "reasoning"},
 		{EventContent, "content"},
 		{EventFinish, "finish"},
+		{EventDone, "done"},
 		{EventKind(99), "unknown"}, // 越界值兜底，不能 panic
 	}
 	for _, tt := range tests {
@@ -214,7 +215,7 @@ func TestHandleStream(t *testing.T) {
 			want: "你好，世界",
 		},
 		{
-			name: "无 [DONE] 直接 EOF 也算正常结束",
+			name: "无结束标记时仍返回已收到的正文",
 			body: chunkLine("abc"),
 			want: "abc",
 		},
@@ -294,7 +295,7 @@ func TestHandleStream(t *testing.T) {
 	}
 }
 
-// 事件序列契约：Kind 的产出顺序固定为 思考 → 回答 → 结束，混合块也不能乱序。
+// 验证思考、正文、停止原因和流结束标记的事件顺序
 func TestHandleStreamEvents(t *testing.T) {
 	t.Run("思考流与回答流交替，事件按块序产出", func(t *testing.T) {
 		body := sseLine("思考1", "", "") +
@@ -314,6 +315,7 @@ func TestHandleStreamEvents(t *testing.T) {
 			{EventReasoning, "思考2"},
 			{EventContent, "回答1"},
 			{EventFinish, ""},
+			{EventDone, ""},
 		}
 		if len(evs) != len(want) {
 			t.Fatalf("事件数 = %d, want %d: %+v", len(evs), len(want), evs)
@@ -333,8 +335,8 @@ func TestHandleStreamEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if len(evs) != 2 {
-			t.Fatalf("事件数 = %d, want 2（混合块必须产出两个事件）: %+v", len(evs), evs)
+		if len(evs) != 3 || evs[2].Kind != EventDone {
+			t.Fatalf("事件序列 = %+v，预期为思考、正文、流结束", evs)
 		}
 		if evs[0].Kind != EventReasoning || evs[0].Text != "先想" {
 			t.Errorf("evs[0] = %+v, want reasoning/先想", evs[0])
@@ -349,8 +351,8 @@ func TestHandleStreamEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if len(evs) != 1 || evs[0].Kind != EventFinish {
-			t.Fatalf("evs = %+v, want 单个 finish 事件", evs)
+		if len(evs) != 2 || evs[0].Kind != EventFinish || evs[1].Kind != EventDone {
+			t.Fatalf("事件序列 = %+v，预期为停止原因、流结束", evs)
 		}
 		if evs[0].FinishReason != "content_filter" {
 			t.Errorf("FinishReason = %q, want content_filter", evs[0].FinishReason)
@@ -366,13 +368,8 @@ func TestHandleStreamEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if len(evs) != 2 {
-			t.Fatalf("事件数 = %d, want 2: %+v", len(evs), evs)
-		}
-		for _, ev := range evs {
-			if ev.Kind == EventContent {
-				t.Fatalf("纯思考流不该产出 content 事件: %+v", ev)
-			}
+		if len(evs) != 3 || evs[0].Kind != EventReasoning || evs[1].Kind != EventFinish || evs[2].Kind != EventDone {
+			t.Fatalf("事件序列 = %+v，预期为思考、停止原因、流结束", evs)
 		}
 	})
 
@@ -384,8 +381,21 @@ func TestHandleStreamEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if len(evs) != 0 {
-			t.Fatalf("evs = %+v, want 空", evs)
+		if len(evs) != 1 || evs[0] != (StreamEvent{Kind: EventDone}) {
+			t.Fatalf("事件序列 = %+v，预期只有流结束事件", evs)
+		}
+	})
+
+	t.Run("收到停止原因后直接读到文件末尾，不产出流结束事件", func(t *testing.T) {
+		body := chunkLine("半截回复") + sseLine("", "", "stop")
+		evs, err := drainEvents(strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("读取流失败: %v", err)
+		}
+
+		if len(evs) != 2 || evs[0] != (StreamEvent{Kind: EventContent, Text: "半截回复"}) ||
+			evs[1] != (StreamEvent{Kind: EventFinish, FinishReason: "stop"}) {
+			t.Fatalf("事件序列 = %+v，预期只有正文和停止原因", evs)
 		}
 	})
 }
@@ -673,7 +683,7 @@ func TestStreamChatRequestThinkingContract(t *testing.T) {
 	}
 }
 
-// 端到端：开启思考后，事件序列应为 思考… → 回答… → 结束，且中途无错误。
+// 验证开启思考时，从请求到结束标记的完整事件序列
 func TestStreamChatThinkingFlow(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -696,7 +706,7 @@ func TestStreamChatThinkingFlow(t *testing.T) {
 		evs = append(evs, ev)
 	}
 
-	wantKinds := []EventKind{EventReasoning, EventReasoning, EventContent, EventContent, EventFinish}
+	wantKinds := []EventKind{EventReasoning, EventReasoning, EventContent, EventContent, EventFinish, EventDone}
 	if len(evs) != len(wantKinds) {
 		t.Fatalf("事件数 = %d, want %d: %+v", len(evs), len(wantKinds), evs)
 	}
@@ -705,8 +715,8 @@ func TestStreamChatThinkingFlow(t *testing.T) {
 			t.Fatalf("evs[%d].Kind = %v, want %v（全序列: %v）", i, evs[i].Kind, want, evs)
 		}
 	}
-	if last := evs[len(evs)-1]; last.FinishReason != "stop" {
-		t.Errorf("最后事件 FinishReason = %q, want stop", last.FinishReason)
+	if finish := evs[len(evs)-2]; finish.FinishReason != "stop" {
+		t.Errorf("停止原因 = %q，预期为 stop", finish.FinishReason)
 	}
 }
 

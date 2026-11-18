@@ -70,6 +70,7 @@ func handleStream(body io.Reader, yield func(StreamEvent, error) bool) error {
 		data = strings.TrimSpace(data)
 
 		if data == doneSentinel { // 流结束
+			yield(StreamEvent{Kind: EventDone}, nil)
 			return nil
 		}
 

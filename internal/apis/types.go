@@ -28,6 +28,7 @@ const (
 	EventReasoning EventKind = iota
 	EventContent
 	EventFinish
+	EventDone
 )
 
 func (k EventKind) String() string {
@@ -38,6 +39,8 @@ func (k EventKind) String() string {
 		return "content"
 	case EventFinish:
 		return "finish"
+	case EventDone:
+		return "done"
 	default:
 		return "unknown"
 	}
