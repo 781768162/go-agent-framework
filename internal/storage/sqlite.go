@@ -107,8 +107,11 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 		return fmt.Errorf("插入 messages 失败: %w", err)
 	}
 	affected, err := res.RowsAffected() // 检查修改行数
-	if err != nil || affected != 1 {
+	if err != nil {
 		return fmt.Errorf("插入 messages 失败: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("会话 %d 不存在", affected)
 	}
 
 	if err = tx.Commit(); err != nil {
