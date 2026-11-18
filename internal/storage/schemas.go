@@ -1,6 +1,14 @@
 package storage
 
-var schemaV1 = []string{
+type Schema [][]string
+
+var latestVersion = len(schema)
+
+var schema = [][]string{
+	rawV1,
+}
+
+var rawV1 = []string{
 	`PRAGMA user_version = 1;`,
 
 	`CREATE TABLE IF NOT EXISTS sessions (

@@ -1,0 +1,26 @@
+package storage
+
+type Session struct {
+	Title string
+}
+
+type Message struct {
+	SessionID        int64
+	Role             string
+	Content          string
+	ReasoningContent string
+	ToolCalls        string
+	ToolCallId       int
+}
+
+type ApiCall struct {
+	SessionID             int
+	Model                 string
+	Thinking              int
+	PromptTokens          int
+	CompletionTokens      int
+	PromptCacheHitTokens  int
+	PromptCacheMissTokens int
+	FinishReason          string
+	DurationMs            int
+}
