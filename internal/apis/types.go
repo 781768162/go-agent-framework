@@ -55,8 +55,9 @@ type Tool struct {
 }
 
 type FunctionDef struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 // 流式事件

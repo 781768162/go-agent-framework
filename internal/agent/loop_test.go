@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -22,7 +23,7 @@ const (
 	callFinishEvent = "data: " + `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n"
 	replyStream     = "data: " + `{"choices":[{"delta":{"reasoning_content":"思考"}}]}` + "\n\n" +
 		"data: " + `{"choices":[{"delta":{"content":"答复"}}]}` + "\n\n" + stopEvent + doneEvent
-	callStream = "data: " + `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"mock","arguments":"{}"}},{"index":1,"id":"b","type":"function","function":{"name":"mock","arguments":"{}"}}]}}]}`
+	callStream = "data: " + `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat fixture.txt\"}"}},{"index":1,"id":"b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"> denied.txt\"}"}}]}}]}`
 )
 
 type exchange struct {
@@ -118,15 +119,32 @@ func inputOnce(t *testing.T, text string) InputFunc {
 
 func TestRunTurnToolResultsAndNextTurn(t *testing.T) {
 	user := apis.Message{Role: "user", Content: "调用工具"}
-	call := apis.ToolCall{Id: "a", Type: "function", Function: apis.ToolCallFunction{Name: "mock", Args: "{}"}}
+	call := apis.ToolCall{Id: "a", Type: "function", Function: apis.ToolCallFunction{Name: "bash", Args: `{"command":"cat fixture.txt"}`}}
 	secondCall := call
 	secondCall.Id = "b"
+	secondCall.Function.Args = `{"command":"> denied.txt"}`
 	request := apis.Message{Role: "assistant", ToolCalls: []apis.ToolCall{call, secondCall}}
-	const result = "模拟工具结果，尚未实现！"
+	const result = "文件内容"
+	t.Chdir(t.TempDir())
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("fixture.txt", []byte(result), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var confirmed []string
+	confirm := func(_ context.Context, gotDir, command string) (bool, error) {
+		if gotDir != dir {
+			t.Fatalf("确认目录 = %q，预期 %q", gotDir, dir)
+		}
+		confirmed = append(confirmed, command)
+		return command == "cat fixture.txt", nil
+	}
 	history := []apis.Message{
 		user, request,
 		{Role: "tool", ToolCallId: "a", Content: result},
-		{Role: "tool", ToolCallId: "b", Content: result},
+		{Role: "tool", ToolCallId: "b", Content: "用户拒绝执行"},
 		{Role: "assistant", ReasoningContent: "思考", Content: "答复"},
 		{Role: "user", Content: "继续"},
 		{Role: "assistant", ReasoningContent: "思考", Content: "答复"},
@@ -136,11 +154,18 @@ func TestRunTurnToolResultsAndNextTurn(t *testing.T) {
 		exchange{history[:4], replyStream},
 		exchange{history[:6], replyStream},
 	)
-	if err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput); err != nil {
+	if err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput, confirm); err != nil {
 		t.Fatal(err)
 	}
 	assertHistory(t, loop, history[:5])
-	if err := loop.RunTurn(t.Context(), inputOnce(t, "继续"), discardOutput); err != nil {
+	if !reflect.DeepEqual(confirmed, []string{"cat fixture.txt", "> denied.txt"}) {
+		t.Fatalf("确认的命令 = %v", confirmed)
+	}
+	if _, err := os.Stat("denied.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("拒绝后检查文件，收到 %v", err)
+	}
+
+	if err := loop.RunTurn(t.Context(), inputOnce(t, "继续"), discardOutput, unexpectedConfirm(t)); err != nil {
 		t.Fatal(err)
 	}
 	assertHistory(t, loop, history)
@@ -155,13 +180,14 @@ func TestRunTurnReplyBoundaries(t *testing.T) {
 	}{
 		{"空回复", stopEvent + doneEvent, false, false},
 		{"调用列表为空", callFinishEvent + doneEvent, true, false},
+		{"工具调用结束后断流", callStream + "\n\n" + callFinishEvent, true, true},
 		{"结束原因之后断流", strings.TrimSuffix(replyStream, doneEvent), true, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			want := []apis.Message{user}
 			loop := newTestLoop(t, exchange{want, tc.stream})
-			err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput)
+			err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput, unexpectedConfirm(t))
 			if (err != nil) != tc.wantError || errors.Is(err, io.ErrUnexpectedEOF) != tc.wantEOF {
 				t.Fatalf("返回错误 = %v", err)
 			}
@@ -172,7 +198,7 @@ func TestRunTurnReplyBoundaries(t *testing.T) {
 
 func TestRunTurnInputEOF(t *testing.T) {
 	loop := newTestLoop(t)
-	err := loop.RunTurn(t.Context(), func(context.Context) (string, error) { return "", io.EOF }, discardOutput)
+	err := loop.RunTurn(t.Context(), func(context.Context) (string, error) { return "", io.EOF }, discardOutput, unexpectedConfirm(t))
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("预期输入结束，收到 %v", err)
 	}
@@ -187,7 +213,7 @@ func TestRunTurnToolWriteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput)
+	err = loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput, func(context.Context, string, string) (bool, error) { return false, nil })
 	if err == nil || !strings.Contains(err.Error(), "工具结果写入失败") {
 		t.Fatalf("预期工具结果写入错误，收到 %v", err)
 	}
@@ -212,11 +238,11 @@ func TestRunTurnOutput(t *testing.T) {
 	err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), func(_ context.Context, text string, reasoning bool) error {
 		got = append(got, fragment{text, reasoning})
 		return nil
-	})
+	}, unexpectedConfirm(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []fragment{{"思考", true}, {"答复", false}}
+	want := []fragment{{"思考", true}, {"\n答复", false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("输出片段 = %+v，预期 %+v", got, want)
 	}
@@ -233,12 +259,12 @@ func TestRunTurnOutputFailure(t *testing.T) {
 				if failed {
 					t.Error("输出失败后仍收到片段")
 				}
-				if text == failAt {
+				if strings.TrimPrefix(text, "\n") == failAt {
 					failed = true
 					return wantErr
 				}
 				return nil
-			})
+			}, unexpectedConfirm(t))
 			if !errors.Is(err, wantErr) {
 				t.Fatalf("预期输出中断，收到 %v", err)
 			}
@@ -251,7 +277,7 @@ func TestNewSessionStartsSeparateHistory(t *testing.T) {
 	first := apis.Message{Role: "user", Content: "第一段对话"}
 	second := apis.Message{Role: "user", Content: "第二段对话"}
 	loop := newTestLoop(t, exchange{[]apis.Message{first}, replyStream}, exchange{[]apis.Message{second}, replyStream})
-	if err := loop.RunTurn(t.Context(), inputOnce(t, first.Content), discardOutput); err != nil {
+	if err := loop.RunTurn(t.Context(), inputOnce(t, first.Content), discardOutput, unexpectedConfirm(t)); err != nil {
 		t.Fatal(err)
 	}
 	firstID := loop.SessionId
@@ -261,7 +287,7 @@ func TestNewSessionStartsSeparateHistory(t *testing.T) {
 	if loop.SessionId == firstID {
 		t.Fatal("新会话复用了旧会话 ID")
 	}
-	if err := loop.RunTurn(t.Context(), inputOnce(t, second.Content), discardOutput); err != nil {
+	if err := loop.RunTurn(t.Context(), inputOnce(t, second.Content), discardOutput, unexpectedConfirm(t)); err != nil {
 		t.Fatal(err)
 	}
 	assertHistory(t, loop, []apis.Message{second, {Role: "assistant", Content: "答复", ReasoningContent: "思考"}})
@@ -271,5 +297,64 @@ func TestNewSessionStartsSeparateHistory(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].Content != first.Content || rows[1].Content != "答复" {
 		t.Fatalf("旧会话历史 = %+v", rows)
+	}
+}
+
+func unexpectedConfirm(t *testing.T) ConfirmFunc {
+	return func(context.Context, string, string) (bool, error) {
+		t.Fatal("意外请求执行工具")
+		return false, nil
+	}
+}
+
+func TestToolCallInvalidArguments(t *testing.T) {
+	for _, tc := range []struct{ name, args, want string }{
+		{"残缺对象", `{"command":`, "必须是 JSON 对象"},
+		{"数组", `[]`, "必须是 JSON 对象"},
+		{"类型错误", `{"command":12}`, "参数解析错误"},
+		{"命令带有未知字段", `{"command":"pwd","cwd":"/tmp"}`, `unknown field "cwd"`},
+		{"缺少命令", `{}`, "命令串为空"},
+		{"空白命令", `{"command":"  "}`, "命令串为空"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call := apis.ToolCall{Id: "a", Function: apis.ToolCallFunction{Name: "bash", Args: tc.args}}
+			result, err := new(AgentLoop).runToolCall(t.Context(), call, t.TempDir(), unexpectedConfirm(t))
+			if err != nil || !strings.Contains(result, tc.want) {
+				t.Fatalf("工具结果 = %q，错误 = %v", result, err)
+			}
+		})
+	}
+}
+
+func TestToolCallCommandFailure(t *testing.T) {
+	call := apis.ToolCall{Function: apis.ToolCallFunction{Name: "bash", Args: `{"command":"echo diagnostic >&2; exit 7"}`}}
+	result, err := new(AgentLoop).runToolCall(t.Context(), call, t.TempDir(), func(context.Context, string, string) (bool, error) { return true, nil })
+	if err != nil || !strings.Contains(result, "exit status 7") || !strings.Contains(result, "diagnostic") {
+		t.Fatalf("工具结果 = %q，错误 = %v", result, err)
+	}
+}
+
+func TestRunTurnConfirmInterrupted(t *testing.T) {
+	for _, want := range []error{io.EOF, context.Canceled} {
+		t.Run(want.Error(), func(t *testing.T) {
+			user := apis.Message{Role: "user", Content: "调用工具"}
+			loop := newTestLoop(t, exchange{[]apis.Message{user}, callStream + "\n\n" + callFinishEvent + doneEvent})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			err := loop.RunTurn(ctx, inputOnce(t, user.Content), discardOutput, func(context.Context, string, string) (bool, error) {
+				if want == context.Canceled {
+					cancel()
+					return true, nil
+				}
+				return false, io.EOF
+			})
+			if !errors.Is(err, want) {
+				t.Fatalf("返回错误 = %v，预期 %v", err, want)
+			}
+			if len(loop.msgs) != 2 || len(loop.msgs[1].ToolCalls) != 2 {
+				t.Fatalf("中断后的历史 = %+v", loop.msgs)
+			}
+			assertHistory(t, loop, []apis.Message{user, loop.msgs[1]})
+		})
 	}
 }

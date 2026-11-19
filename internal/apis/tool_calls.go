@@ -1,7 +1,6 @@
 package apis
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -76,11 +75,6 @@ func CheckToolCalls(calls []ToolCall) error {
 		}
 		if strings.TrimSpace(call.Function.Name) == "" {
 			return fmt.Errorf("工具调用 %s 缺少函数名", call.Id)
-		}
-
-		args := strings.TrimSpace(call.Function.Args)
-		if !strings.HasPrefix(args, "{") || !json.Valid([]byte(args)) {
-			return fmt.Errorf("工具调用 %s 的参数必须是 JSON 对象", call.Id)
 		}
 	}
 

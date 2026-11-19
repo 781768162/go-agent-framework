@@ -28,8 +28,19 @@ func main() {
 			{
 				Type: "function",
 				Function: apis.FunctionDef{
-					Name:        "get_mock_result",
-					Description: "获取模拟工具结果",
+					Name:        "bash",
+					Description: "经用户确认后，在当前工作目录执行 Bash 命令并返回输出。",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"command": map[string]any{
+								"type":        "string",
+								"description": "要执行的完整 Bash 命令。",
+							},
+						},
+						"required":             []string{"command"},
+						"additionalProperties": false,
+					},
 				},
 			},
 		},
@@ -46,7 +57,7 @@ func main() {
 	}
 	terminal := cli.NewCli(os.Stdin, os.Stdout)
 	for {
-		err := mainLoop.RunTurn(ctx, terminal.ReadInput, terminal.WriteOutput)
+		err := mainLoop.RunTurn(ctx, terminal.ReadInput, terminal.WriteOutput, terminal.ConfirmOperateByUser)
 		fmt.Println()
 		if errors.Is(err, io.EOF) {
 			fmt.Println("会话终止")

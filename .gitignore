@@ -12,6 +12,7 @@ coverage.out
 .env.*
 !.env.example
 !.env.*.example
+*.txt
 
 # SQLite databases and sidecar files
 *.db
