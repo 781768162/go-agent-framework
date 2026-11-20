@@ -1,6 +1,7 @@
 package storage
 
 type Session struct {
+	Id    int64
 	Title string
 }
 

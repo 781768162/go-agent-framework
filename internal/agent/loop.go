@@ -65,19 +65,31 @@ func (l *AgentLoop) History() []apis.Message {
 
 // 将 Loop 绑定到会话
 func (l *AgentLoop) BindSession(ctx context.Context, sessionId int64) error {
-	// 查询sessionId
-	_, err := storage.QuerySession(ctx, l.db, sessionId)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("sessionId %d 不存在: %w", sessionId, err)
-	}
+	msgs, err := LoadHistory(ctx, l.db, sessionId)
 	if err != nil {
 		return err
 	}
 
-	// 载入msgs
-	msgStorages, err := storage.QueryMessages(ctx, l.db, sessionId)
+	l.SessionId = sessionId
+	l.msgs = msgs
+
+	return nil
+}
+
+func LoadHistory(ctx context.Context, db *sql.DB, sessionId int64) ([]apis.Message, error) {
+	// 查询sessionId
+	_, err := storage.QuerySession(ctx, db, sessionId)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("sessionId %d 不存在: %w", sessionId, err)
+	}
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	// 载入msgs
+	msgStorages, err := storage.QueryMessages(ctx, db, sessionId)
+	if err != nil {
+		return nil, err
 	}
 
 	var msgs []apis.Message
@@ -85,7 +97,7 @@ func (l *AgentLoop) BindSession(ctx context.Context, sessionId int64) error {
 		var calls []apis.ToolCall
 		if msgStorage.ToolCalls != "" {
 			if err := json.Unmarshal([]byte(msgStorage.ToolCalls), &calls); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		msgs = append(msgs, apis.Message{
@@ -97,10 +109,7 @@ func (l *AgentLoop) BindSession(ctx context.Context, sessionId int64) error {
 		})
 	}
 
-	l.SessionId = sessionId
-	l.msgs = msgs
-
-	return nil
+	return msgs, nil
 }
 
 // 推进对话轮次
