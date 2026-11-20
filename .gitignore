@@ -27,3 +27,6 @@ coverage.out
 *.sqlite3-journal
 *.sqlite3-shm
 *.sqlite3-wal
+
+# Local docs (review notes)
+/docs/

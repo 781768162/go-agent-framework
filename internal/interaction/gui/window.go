@@ -15,143 +15,132 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-type window struct {
-	db              *sql.DB
-	cfg             config.Config
-	opts            apis.StreamOptions
-	ctx             context.Context
-	draft           string
-	sessions        []storage.Session
-	loops           map[int64]*agent.AgentLoop
-	selectedSession storage.Session
-	history         map[int64][]*chatMessage
-	sessionErr      error
-	win             *mygo.Window
-	running         map[int64]bool
-}
-
-type chatMessage struct {
-	apis.Message
-	reasoningOpen bool
-}
-
-func (w *window) view(c *ui.Context) {
+func (a *app) view(c *ui.Context) {
 	ui.Row(c).Fill().Children(func() {
-		w.sidebar(c)
-		w.chat(c)
+		a.sidebar(c)
+		a.chat(c)
 	})
 }
 
-func (w *window) sidebar(c *ui.Context) {
+func (a *app) sidebar(c *ui.Context) {
 	ui.Column(c).Width(200).FillHeight().Children(func() {
-		for _, session := range w.sessions {
+		for _, session := range a.sessions.list {
 			if ui.Button(c.Key(session.Id), session.Title).Clicked() {
-				w.sessionErr = w.selectSession(session)
+				_ = a.selectSession(session.Id)
 			}
 		}
 	})
 }
 
-func (w *window) chat(c *ui.Context) {
-	title := w.selectedSession.Title
-	chatMsgs := w.history[w.selectedSession.Id]
+func (a *app) chat(c *ui.Context) {
+	curSession, curSessionState, ok := a.selectedSessionState()
+	if !ok {
+		ui.Column(c).Grow(1).FillHeight().Children(func() {
+			ui.Text(c, "暂无会话")
+		})
+		return
+	}
+	chatMsgs := curSessionState.messages
 
 	ui.Column(c).Grow(1).FillHeight().Children(func() {
-		ui.Text(c, title) // 标题栏
+		ui.Text(c, curSession.Title) // 标题栏
 
-		if w.sessionErr != nil {
-			ui.Text(c, fmt.Sprintf("切换会话失败: %v", w.sessionErr))
+		if curSessionState.err != nil {
+			ui.Text(c, curSessionState.err.Error())
 		}
-		w.scrollChat(c, chatMsgs) // 对话记录栏
+		a.scrollChat(c, curSession.Id, chatMsgs) // 对话记录栏
 
-		ui.TextArea(c, &w.draft) // 输入框
-		w.submitButton(c)        // 发送按钮
+		ui.TextArea(c, &curSessionState.inputText)        // 输入框
+		a.submitButton(c, curSession.Id, curSessionState) // 发送按钮
 	})
 }
 
-func (w *window) scrollChat(c *ui.Context, chatMsgs []*chatMessage) {
-	ui.Scroll(c.Key(w.selectedSession.Id)).Grow(1).Children(func() {
+func (a *app) scrollChat(c *ui.Context, sessionId int64, chatMsgs []*chatMessage) {
+	ui.Scroll(c.Key(sessionId)).Grow(1).Children(func() {
 		for _, chatMsg := range chatMsgs {
-			ui.Column(c.Key(chatMsg)).Children(func() {
-				switch chatMsg.Role {
-				case "user":
-					ui.Text(c, fmt.Sprintf("[用户] %s\n", chatMsg.Content))
-				case "assistant":
-					if chatMsg.ReasoningContent != "" { //思考内容
-						ui.Collapsible(
-							c,
-							"思考",
-							&chatMsg.reasoningOpen,
-							func() {
-								ui.Text(c, fmt.Sprintf("[思考内容] %s\n", chatMsg.ReasoningContent))
-							},
-						)
-					}
-					if chatMsg.Content != "" { // 正文内容
-						ui.Text(c, fmt.Sprintf("[回复] %s\n", chatMsg.Content))
-					}
-					for _, call := range chatMsg.ToolCalls { // 工具调用
-						ui.Text(c, fmt.Sprintf("[工具调用] %s %s\n", call.Function.Name, call.Function.Args))
-					}
-				case "tool": // 工具结果
-					ui.Text(c, fmt.Sprintf("[工具结果] %s\n", chatMsg.Content))
-				default:
-					ui.Text(c, fmt.Sprintf("%s\n", chatMsg.Content))
-				}
-			})
+			a.renderMessage(c, chatMsg)
 		}
 	})
 }
 
-func (w *window) submitButton(c *ui.Context) {
-	if ui.Button(c, "提交").Clicked() {
-		if strings.TrimSpace(w.draft) != "" {
-			submitId := w.selectedSession.Id
-			submitDraft := w.draft
-
-			if submitId == 0 || strings.TrimSpace(submitDraft) == "" {
-				return
+func (a *app) renderMessage(c *ui.Context, msg *chatMessage) {
+	ui.Column(c.Key(msg)).Children(func() {
+		switch msg.Role {
+		case "user":
+			ui.Text(c, fmt.Sprintf("[用户] %s\n", msg.Content))
+		case "assistant":
+			if msg.ReasoningContent != "" { //思考内容
+				ui.Collapsible(
+					c,
+					"思考",
+					&msg.reasoningOpen,
+					func() {
+						ui.Text(c, fmt.Sprintf("[思考内容] %s\n", msg.ReasoningContent))
+					},
+				)
 			}
-
-			w.submit(submitId, submitDraft)
+			if msg.Content != "" { // 正文内容
+				ui.Text(c, fmt.Sprintf("[回复] %s\n", msg.Content))
+			}
+			for _, call := range msg.ToolCalls { // 工具调用
+				ui.Text(c, fmt.Sprintf("[工具调用] %s %s\n", call.Function.Name, call.Function.Args))
+			}
+		case "tool": // 工具结果
+			ui.Text(c, fmt.Sprintf("[工具结果] %s\n", msg.Content))
+		default:
+			ui.Text(c, fmt.Sprintf("%s\n", msg.Content))
 		}
+	})
+}
+
+func (a *app) submitButton(c *ui.Context, sessionId int64, state *sessionState) {
+	if ui.Button(c, "提交").Clicked() {
+		if sessionId == 0 || strings.TrimSpace(state.inputText) == "" {
+			return
+		}
+		a.submit(sessionId, state.inputText)
 	}
 }
 
 // 加载指定 session
-func (w *window) selectSession(session storage.Session) error {
-	if _, loaded := w.history[session.Id]; !loaded { // 加载指定 sessionId 的历史
-		msgs, err := agent.LoadHistory(w.ctx, w.db, session.Id)
+func (a *app) selectSession(selectedId int64) error {
+	a.sessions.selectedId = selectedId
+	state := a.sessionState(selectedId)
+
+	if !state.historyLoaded { // 未加载指定 sessionId 的历史时
+		msgs, err := agent.LoadHistory(a.ctx, a.db, selectedId)
 		if err != nil {
+			state.err = fmt.Errorf("加载会话历史失败: %w", err)
 			return err
 		}
 
-		chatMsgs := make([]*chatMessage, 0, len(msgs)) // 填充history
+		chatMsgs := make([]*chatMessage, 0, len(msgs)) // 填充messages
 		for _, msg := range msgs {
 			chatMsgs = append(chatMsgs, &chatMessage{Message: msg})
 		}
 
-		w.history[session.Id] = chatMsgs
+		state.messages = chatMsgs
+		state.historyLoaded = true
+		state.err = nil
 	}
 
-	w.selectedSession = session
 	return nil
 }
 
-func (w *window) submit(submitId int64, submitDraft string) {
-	if w.running[submitId] {
+func (a *app) submit(submitId int64, submitInputText string) {
+	submitState := a.sessionState(submitId)
+	if submitState.sessionRunning {
 		return
 	}
 
-	submitLoop := w.loops[submitId]
-	if submitLoop == nil {
-		submitLoop = agent.NewAgentLoop(w.cfg, w.db, w.opts)
-		if err := submitLoop.BindSession(w.ctx, submitId); err != nil {
-			w.sessionErr = err
+	submitLoop := submitState.loop // 取得指定 session 的 loop
+	if submitLoop == nil {         // loop 为空，新建
+		submitLoop = agent.NewAgentLoop(a.cfg, a.db, submitState.opts)
+		if err := submitLoop.BindSession(a.ctx, submitId); err != nil { // 绑定 loop 至 session
+			submitState.err = err
 			return
 		}
-
-		w.loops[submitId] = submitLoop
+		submitState.loop = submitLoop
 	}
 
 	inputFunc := func(ctx context.Context) (string, error) {
@@ -159,61 +148,41 @@ func (w *window) submit(submitId int64, submitDraft string) {
 			return "", err
 		}
 
-		return submitDraft, nil
+		return submitInputText, nil
 	}
-	var reply *chatMessage
 	outputFunc := func(ctx context.Context, chunk string, role agent.OutputRole) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		w.win.Update(func() { // 更新窗口
-			if role == agent.IsToolContent {
-				toolMsg := &chatMessage{
-					Message: apis.Message{Role: "tool", Content: chunk},
-				}
-				w.history[submitId] = append(w.history[submitId], toolMsg)
-				reply = nil
-				return
-			}
-
-			if reply == nil {
-				reply = &chatMessage{
-					Message: apis.Message{Role: "assistant"},
-				}
-				w.history[submitId] = append(w.history[submitId], reply)
-			}
-
-			switch role {
-			case agent.IsReasoningContent:
-				reply.ReasoningContent += chunk
-			case agent.IsContent:
-				reply.Content += chunk
-			}
+		a.win.Update(func() { // 更新窗口
+			submitState.appendStreamChunk(role, chunk)
 		})
 
 		return nil
 	}
+
 	confirmFunc := func(ctx context.Context, dir, command string) (bool, error) {
-		return false, ctx.Err()
+		return false, ctx.Err() // TODO: 待实现
 	}
 
-	w.running[submitId] = true
-	w.draft = ""
+	submitState.sessionRunning = true
+	submitState.err = nil
+	submitState.inputText = ""
+	submitState.curReply = nil
+	submitState.messages = append(submitState.messages, &chatMessage{
+		Message: apis.Message{Role: "user", Content: submitInputText},
+	}) // 追加窗口对话历史
 
-	userMsg := &chatMessage{
-		Message: apis.Message{Role: "user", Content: submitDraft},
-	}
-	w.history[submitId] = append(w.history[submitId], userMsg) // 追加窗口对话历史
+	go func() { // 后台 session 运行
+		err := submitLoop.RunTurn(a.ctx, inputFunc, outputFunc, confirmFunc)
 
-	go func() { // 后台提交
-		err := submitLoop.RunTurn(w.ctx, inputFunc, outputFunc, confirmFunc)
-
-		w.win.Update(func() {
-			delete(w.running, submitId)
+		a.win.Update(func() {
+			submitState.sessionRunning = false
+			submitState.curReply = nil
 
 			if err != nil {
-				fmt.Printf("会话 %d 提交失败: %v", submitId, err)
+				submitState.err = err
 			}
 		})
 	}()
@@ -225,29 +194,30 @@ func Run(ctx context.Context, db *sql.DB, cfg config.Config, opts apis.StreamOpt
 		return err
 	}
 
-	w := &window{
-		db:       db,
-		ctx:      ctx,
-		cfg:      cfg,
-		opts:     opts,
-		sessions: sessions,
-		history:  make(map[int64][]*chatMessage),
-		loops:    make(map[int64]*agent.AgentLoop),
-		running:  make(map[int64]bool),
+	a := &app{
+		ctx:         ctx,
+		db:          db,
+		cfg:         cfg,
+		defaultOpts: opts,
+
+		sessions: sessionList{
+			list: sessions,
+		},
+		sessionStates: make(map[int64]*sessionState),
 	}
 
-	if len(sessions) > 0 {
-		if err := w.selectSession(sessions[0]); err != nil {
+	if len(sessions) > 0 { // 默认加载第一条
+		if err := a.selectSession(a.sessions.list[0].Id); err != nil {
 			return err
 		}
 	}
 
 	mygo.App.WhenReady(func() {
-		w.win = mygo.NewWindow(mygo.WindowOptions{
+		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:   "SAISON",
 			Width:   960,
 			Height:  640,
-			Content: ui.View(w.view),
+			Content: ui.View(a.view),
 		})
 	})
 
