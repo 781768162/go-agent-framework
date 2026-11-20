@@ -127,6 +127,20 @@ func CreateMessage(ctx context.Context, db *sql.DB, msg Message) error {
 	return nil
 }
 
+func QuerySession(ctx context.Context, db *sql.DB, sessionId int64) (string, error) {
+	var res string
+	err := db.QueryRowContext(
+		ctx,
+		`SELECT title FROM sessions WHERE id = ?`,
+		sessionId,
+	).Scan(&res)
+	if err != nil {
+		return "", err
+	}
+
+	return res, nil
+}
+
 // 按 sessionId 查询 messages 记录
 func QueryMessages(ctx context.Context, db *sql.DB, sessionId int64) ([]Message, error) {
 	rows, err := db.QueryContext(

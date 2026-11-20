@@ -154,10 +154,20 @@ func TestRunTurnToolResultsAndNextTurn(t *testing.T) {
 		exchange{history[:4], replyStream},
 		exchange{history[:6], replyStream},
 	)
-	if err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), discardOutput, confirm); err != nil {
+	var results []string
+	output := func(_ context.Context, text string, role OutputRole) error {
+		if role == IsToolContent {
+			results = append(results, text)
+		}
+		return nil
+	}
+	if err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), output, confirm); err != nil {
 		t.Fatal(err)
 	}
 	assertHistory(t, loop, history[:5])
+	if !reflect.DeepEqual(results, []string{result, "用户拒绝执行"}) {
+		t.Fatalf("实时工具输出 = %q", results)
+	}
 	if !reflect.DeepEqual(confirmed, []string{"cat fixture.txt", "> denied.txt"}) {
 		t.Fatalf("确认的命令 = %v", confirmed)
 	}
@@ -223,7 +233,7 @@ func TestRunTurnToolWriteFailure(t *testing.T) {
 	assertHistory(t, loop, []apis.Message{user, loop.msgs[1]})
 }
 
-func discardOutput(context.Context, string, bool) error {
+func discardOutput(context.Context, string, OutputRole) error {
 	return nil
 }
 
@@ -231,18 +241,18 @@ func TestRunTurnOutput(t *testing.T) {
 	user := apis.Message{Role: "user", Content: "测试输出"}
 	loop := newTestLoop(t, exchange{[]apis.Message{user}, replyStream})
 	type fragment struct {
-		text      string
-		reasoning bool
+		text string
+		role OutputRole
 	}
 	var got []fragment
-	err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), func(_ context.Context, text string, reasoning bool) error {
-		got = append(got, fragment{text, reasoning})
+	err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), func(_ context.Context, text string, role OutputRole) error {
+		got = append(got, fragment{text, role})
 		return nil
 	}, unexpectedConfirm(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []fragment{{"思考", true}, {"\n答复", false}}
+	want := []fragment{{"思考", IsReasoningContent}, {"\n答复", IsContent}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("输出片段 = %+v，预期 %+v", got, want)
 	}
@@ -255,7 +265,7 @@ func TestRunTurnOutputFailure(t *testing.T) {
 			loop := newTestLoop(t, exchange{[]apis.Message{user}, replyStream})
 			wantErr := errors.New("输出中断")
 			failed := false
-			err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), func(_ context.Context, text string, _ bool) error {
+			err := loop.RunTurn(t.Context(), inputOnce(t, user.Content), func(_ context.Context, text string, _ OutputRole) error {
 				if failed {
 					t.Error("输出失败后仍收到片段")
 				}
@@ -356,5 +366,122 @@ func TestRunTurnConfirmInterrupted(t *testing.T) {
 			}
 			assertHistory(t, loop, []apis.Message{user, loop.msgs[1]})
 		})
+	}
+}
+
+func TestBindSessionContinuesStoredConversation(t *testing.T) {
+	ctx := t.Context()
+	call := apis.ToolCall{Id: "call-1", Type: "function", Function: apis.ToolCallFunction{Name: "bash", Args: `{"command":"pwd"}`}}
+	history := []apis.Message{
+		{Role: "user", Content: "查看目录"},
+		{Role: "assistant", ReasoningContent: "需要读取工作目录", ToolCalls: []apis.ToolCall{call}},
+		{Role: "tool", ToolCallId: call.Id, Content: "/workspace"},
+		{Role: "assistant", Content: "目录是 /workspace"},
+	}
+	next := apis.Message{Role: "user", Content: "刚才的目录是什么？"}
+	request := append(history, next)
+	loop := newTestLoop(t, exchange{request, replyStream})
+	targetID := loop.SessionId
+	for _, msg := range history {
+		if err := loop.appendMessage(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := loop.NewSession(ctx, "另一个会话"); err != nil {
+		t.Fatal(err)
+	}
+	otherID := loop.SessionId
+	if err := loop.appendMessage(ctx, apis.Message{Role: "user", Content: "独立的话题"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := storage.QueryMessages(ctx, loop.db, otherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := loop.BindSession(ctx, targetID); err != nil {
+		t.Fatal(err)
+	}
+	if loop.SessionId != targetID {
+		t.Fatalf("绑定的会话 = %d，预期 %d", loop.SessionId, targetID)
+	}
+	if err := loop.RunTurn(ctx, inputOnce(t, next.Content), discardOutput, unexpectedConfirm(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := storage.QueryMessages(ctx, loop.db, targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(request)+1 || rows[len(history)].Content != next.Content || rows[len(request)].Content != "答复" {
+		t.Fatalf("续聊后的目标会话 = %+v", rows)
+	}
+	after, err := storage.QueryMessages(ctx, loop.db, otherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("其他会话的记录发生变化：%+v", after)
+	}
+}
+
+func TestBindSessionFailureKeepsCurrentSession(t *testing.T) {
+	ctx := t.Context()
+	loop := newTestLoop(t)
+	currentID := loop.SessionId
+	msg := apis.Message{Role: "user", Content: "保留这段历史"}
+	if err := loop.appendMessage(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	brokenID, err := storage.CreateSession(ctx, loop.db, "历史损坏")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []storage.Message{
+		{SessionId: brokenID, Role: "user", Content: "有效的第一条"},
+		{SessionId: brokenID, Role: "assistant", ToolCalls: "["},
+	} {
+		if err := storage.CreateMessage(ctx, loop.db, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   int64
+	}{
+		{"会话不存在", brokenID + 1},
+		{"工具调用损坏", brokenID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := loop.BindSession(ctx, tc.id); err == nil {
+				t.Fatal("预期绑定失败")
+			}
+			if loop.SessionId != currentID {
+				t.Fatalf("绑定失败后会话 ID 变成了 %d", loop.SessionId)
+			}
+			assertHistory(t, loop, []apis.Message{msg})
+		})
+	}
+}
+
+func TestBindEmptySession(t *testing.T) {
+	ctx := t.Context()
+	loop := newTestLoop(t)
+	if err := loop.appendMessage(ctx, apis.Message{Role: "user", Content: "旧消息"}); err != nil {
+		t.Fatal(err)
+	}
+	emptyID, err := storage.CreateSession(ctx, loop.db, "空会话")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := loop.BindSession(ctx, emptyID); err != nil {
+		t.Fatal(err)
+	}
+	if loop.SessionId != emptyID || len(loop.msgs) != 0 {
+		t.Fatalf("绑定空会话后 ID = %d，历史 = %+v", loop.SessionId, loop.msgs)
 	}
 }

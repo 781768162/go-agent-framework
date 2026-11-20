@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,8 +25,16 @@ type AgentLoop struct {
 }
 
 type InputFunc func(context.Context) (string, error)
-type OutputFunc func(context.Context, string, bool) error // bool = isReasoning
+type OutputFunc func(context.Context, string, OutputRole) error
 type ConfirmFunc func(context.Context, string, string) (bool, error)
+
+type OutputRole int
+
+const (
+	IsContent OutputRole = iota
+	IsReasoningContent
+	IsToolContent
+)
 
 type bashArgs struct {
 	Command string `json:"command"`
@@ -50,11 +59,47 @@ func (l *AgentLoop) NewSession(ctx context.Context, title string) error {
 	return nil
 }
 
+func (l *AgentLoop) History() []apis.Message {
+	return l.msgs
+}
+
 // 将 Loop 绑定到会话
 func (l *AgentLoop) BindSession(ctx context.Context, sessionId int64) error {
 	// 查询sessionId
+	_, err := storage.QuerySession(ctx, l.db, sessionId)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("sessionId %d 不存在: %w", sessionId, err)
+	}
+	if err != nil {
+		return err
+	}
 
-	// 载入msgs，cfg，opts
+	// 载入msgs
+	msgStorages, err := storage.QueryMessages(ctx, l.db, sessionId)
+	if err != nil {
+		return err
+	}
+
+	var msgs []apis.Message
+	for _, msgStorage := range msgStorages {
+		var calls []apis.ToolCall
+		if msgStorage.ToolCalls != "" {
+			if err := json.Unmarshal([]byte(msgStorage.ToolCalls), &calls); err != nil {
+				return err
+			}
+		}
+		msgs = append(msgs, apis.Message{
+			Role:             msgStorage.Role,
+			Content:          msgStorage.Content,
+			ReasoningContent: msgStorage.ReasoningContent,
+			ToolCalls:        calls,
+			ToolCallId:       msgStorage.ToolCallId,
+		})
+	}
+
+	l.SessionId = sessionId
+	l.msgs = msgs
+
 	return nil
 }
 
@@ -108,6 +153,10 @@ func (l *AgentLoop) RunTurn(ctx context.Context, inputFunc InputFunc, outputFunc
 			}
 
 			if err := l.appendMessage(ctx, msg); err != nil {
+				return err
+			}
+
+			if err := outputFunc(ctx, toolOutput, IsToolContent); err != nil {
 				return err
 			}
 		}
@@ -189,7 +238,7 @@ func (l *AgentLoop) readReply(ctx context.Context, outputFunc OutputFunc) (apis.
 		case apis.EventReasoning: // 思考内容
 			reasoning = true
 			reasoningOutput.WriteString(event.Text)
-			if err := outputFunc(ctx, event.Text, true); err != nil {
+			if err := outputFunc(ctx, event.Text, IsReasoningContent); err != nil {
 				return apis.Message{}, "", err
 			}
 		case apis.EventContent: // 输出内容
@@ -199,7 +248,7 @@ func (l *AgentLoop) readReply(ctx context.Context, outputFunc OutputFunc) (apis.
 				splitMark = "\n"
 			}
 			output.WriteString(event.Text)
-			if err := outputFunc(ctx, splitMark+event.Text, false); err != nil {
+			if err := outputFunc(ctx, splitMark+event.Text, IsContent); err != nil {
 				return apis.Message{}, "", err
 			}
 		case apis.EventFinish: // 结束原因

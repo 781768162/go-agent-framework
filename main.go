@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -51,11 +52,35 @@ func main() {
 	}
 	defer db.Close()
 
-	mainLoop := agent.NewAgentLoop(cfg, db, opts)
-	if err := mainLoop.NewSession(ctx, "test"); err != nil {
-		log.Fatal(err)
-	}
 	terminal := cli.NewCli(os.Stdin, os.Stdout)
+	mainLoop := agent.NewAgentLoop(cfg, db, opts)
+	selectDone := false // 选择或新建会话
+	for !selectDone {
+		sessionId, err := terminal.SelectSession(ctx)
+		if err != nil || sessionId == -1 {
+			if errors.Is(err, io.EOF) {
+				fmt.Println("程序终止")
+				return
+			}
+			continue
+		}
+		if sessionId == 0 {
+			if err := mainLoop.NewSession(ctx, "test"); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			if err := mainLoop.BindSession(ctx, sessionId); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					fmt.Printf("指定 sesionId %d 不存在\n", sessionId)
+					continue
+				}
+				log.Fatal(err)
+			}
+			terminal.PrintHistory(ctx, mainLoop.History()) // 打印加载历史上下文
+		}
+		selectDone = true
+	}
+
 	for {
 		err := mainLoop.RunTurn(ctx, terminal.ReadInput, terminal.WriteOutput, terminal.ConfirmOperateByUser)
 		fmt.Println()
