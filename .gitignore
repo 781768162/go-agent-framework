@@ -29,4 +29,5 @@ coverage.out
 *.sqlite3-wal
 
 # Local docs (review notes)
-/docs/
+/docs/internal/*
+!/docs/internal/.gitkeep
